@@ -128,12 +128,9 @@ func cleanOutput(contentOut, staticRoot string) error {
 	if err := os.MkdirAll(staticRoot, 0o755); err != nil {
 		return fmt.Errorf("ensure static root: %w", err)
 	}
-	// Remove and recreate the subfolders we manage
-	if err := removeAndRecreate(filepath.Join(staticRoot, "images")); err != nil {
-		return fmt.Errorf("reset static/images: %w", err)
-	}
-	if err := removeAndRecreate(filepath.Join(staticRoot, "galleries")); err != nil {
-		return fmt.Errorf("reset static/galleries: %w", err)
+	// Remove and recreate the subfolder we manage: static/media
+	if err := removeAndRecreate(filepath.Join(staticRoot, "media")); err != nil {
+		return fmt.Errorf("reset static/media: %w", err)
 	}
 	return nil
 }
@@ -352,7 +349,7 @@ func processItem(item Item, loc *time.Location, dl *downloader) error {
 		return fmt.Errorf("rewrite images: %w", err)
 	}
 
-	bodyMD, err := toMarkdownPreserveOrder(processedHTML)
+	bodyMD, err := toMarkdownPreserveOrder(processedHTML, slug)
 	if err != nil {
 		return fmt.Errorf("html->md: %w", err)
 	}
@@ -438,7 +435,7 @@ func setToSortedSlice(m map[string]struct{}) []string {
 }
 
 // Convert HTML to Markdown, preserving paragraph order and text.
-func toMarkdownPreserveOrder(html string) (string, error) {
+func toMarkdownPreserveOrder(html string, slug string) (string, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
 		return "", err
@@ -500,19 +497,8 @@ func toMarkdownPreserveOrder(html string) (string, error) {
 			return
 		}
 
-		// Special handling: Gutenberg gallery block → emit each image in place
+		// Special handling: Gutenberg gallery block → do not emit inline markup; handled by Hugo convention externally
 		if s.Is(".wp-block-gallery, figure.wp-block-gallery") {
-			s.Find("img").Each(func(_ int, img *goquery.Selection) {
-				src, _ := img.Attr("src")
-				alt, _ := img.Attr("alt")
-				alt = strings.TrimSpace(alt)
-				if alt == "" {
-					alt = path.Base(src)
-				}
-				if src != "" {
-					b.WriteString(fmt.Sprintf("![%s](%s)\n\n", alt, src))
-				}
-			})
 			return
 		}
 		// Special handling: Gutenberg video block or plain <video>
@@ -680,8 +666,6 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 			return
 		}
 
-		parentGallery := s.ParentsFiltered(".wp-block-gallery")
-		isGallery := parentGallery.Length() > 0
 		srcset, _ := s.Attr("srcset")
 		best := pickBestSrc(src, srcset)
 		if best == "" {
@@ -691,12 +675,8 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 		// 2) Auf Originaldatei ohne -WxH / -scaled verweisen
 		origURL := toOriginalURL(best)
 
-		base := filepath.Join(*staticDir, "images", slug)
-		relBase := filepath.ToSlash(path.Join("/images", slug))
-		if isGallery {
-			base = filepath.Join(*staticDir, "galleries", slug)
-			relBase = filepath.ToSlash(path.Join("/galleries", slug))
-		}
+		base := filepath.Join(*staticDir, "media", slug)
+		relBase := filepath.ToSlash(path.Join("/media", slug))
 		_ = os.MkdirAll(base, 0o755)
 
 		filename := filenameFromURL(origURL)
@@ -728,8 +708,8 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 			return
 		}
 
-		base := filepath.Join(*staticDir, "videos", slug)
-		relBase := filepath.ToSlash(path.Join("/videos", slug))
+		base := filepath.Join(*staticDir, "media", slug)
+		relBase := filepath.ToSlash(path.Join("/media", slug))
 		_ = os.MkdirAll(base, 0o755)
 
 		filename := filenameFromURL(src)
