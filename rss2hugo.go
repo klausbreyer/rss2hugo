@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	markdown "github.com/JohannesKaufmann/html-to-markdown"
+	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/mmcdole/gofeed"
 	"gopkg.in/yaml.v3"
@@ -69,14 +69,20 @@ var (
 	outDir      = flag.String("out", "content/posts", "Output directory for Hugo Markdown files")
 	staticDir   = flag.String("static", "static", "Hugo static directory (root of images/galleries)")
 	timezone    = flag.String("tz", "Europe/Berlin", "IANA timezone for front matter dates, e.g. Europe/Berlin")
-	limitItems  = flag.Int("limit", 0, "Process only the first N items (0 = all)")
+	limitItems  = flag.Int("limit", 1, "Process only the first N items (0 = all)")
 	concurrency = flag.Int("concurrency", 6, "Concurrent image download workers")
 	verbose     = flag.Bool("v", true, "Verbose output")
+	clean       = flag.Bool("clean", true, "Delete output folders (content/posts and static/images|galleries) before run")
 )
 
 func main() {
 	flag.Parse()
 
+	if *clean {
+		if err := cleanOutput(*outDir, *staticDir); err != nil {
+			log.Fatalf("clean output: %v", err)
+		}
+	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatalf("create out dir: %v", err)
 	}
@@ -111,6 +117,32 @@ func main() {
 	}
 
 	dl.Wait()
+}
+
+func cleanOutput(contentOut, staticRoot string) error {
+	// Remove and recreate content/posts (or specified out dir)
+	if err := removeAndRecreate(contentOut); err != nil {
+		return fmt.Errorf("reset out dir: %w", err)
+	}
+	// Ensure static root exists (don’t nuke the whole static dir)
+	if err := os.MkdirAll(staticRoot, 0o755); err != nil {
+		return fmt.Errorf("ensure static root: %w", err)
+	}
+	// Remove and recreate the subfolders we manage
+	if err := removeAndRecreate(filepath.Join(staticRoot, "images")); err != nil {
+		return fmt.Errorf("reset static/images: %w", err)
+	}
+	if err := removeAndRecreate(filepath.Join(staticRoot, "galleries")); err != nil {
+		return fmt.Errorf("reset static/galleries: %w", err)
+	}
+	return nil
+}
+
+func removeAndRecreate(p string) error {
+	if err := os.RemoveAll(p); err != nil {
+		return err
+	}
+	return os.MkdirAll(p, 0o755)
 }
 
 func loadRSS(src string) (*RSS, error) {
@@ -347,7 +379,8 @@ func processItem(item Item, loc *time.Location, dl *downloader) error {
 		return fmt.Errorf("rewrite images: %w", err)
 	}
 
-	md, err := htmlToMarkdown(processedHTML, u)
+	normalizedHTML := simplifyForMarkdown(processedHTML)
+	bodyMD, err := htmlToMarkdown(normalizedHTML, u)
 	if err != nil {
 		return fmt.Errorf("html->md: %w", err)
 	}
@@ -372,12 +405,12 @@ func processItem(item Item, loc *time.Location, dl *downloader) error {
 		Categories: cats,
 	}
 
-	if err := writeMarkdownFile(slug, fm, md); err != nil {
+	if err := writeMarkdownFile(slug, fm, bodyMD); err != nil {
 		return err
 	}
 
 	if *verbose {
-		log.Printf("✓ %s -> %s.md (%d chars)", item.Title, slug, len(md))
+		log.Printf("✓ %s -> %s.md (%d chars)", item.Title, slug, len(bodyMD))
 	}
 	return nil
 }
@@ -409,6 +442,9 @@ func splitTagsAndCategories(cats []Category) (tags []string, categories []string
 		if name == "" {
 			continue
 		}
+		if strings.EqualFold(name, "Allgemein") {
+			continue
+		}
 		if strings.EqualFold(c.Domain, "post_tag") {
 			mTags[name] = struct{}{}
 		} else {
@@ -430,9 +466,165 @@ func setToSortedSlice(m map[string]struct{}) []string {
 }
 
 func htmlToMarkdown(html string, base *url.URL) (string, error) {
-	conv := markdown.NewConverter(base.String(), true, nil)
-	// Tweak rules if desired
-	return conv.ConvertString(html)
+	conv := md.NewConverter("", false, nil) // keep links as-is (relative)
+
+	// Ensure paragraphs are kept as paragraphs
+	conv.AddRules(md.Rule{
+		Filter: []string{"p"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			content = strings.TrimSpace(content)
+			if content == "" {
+				return nil
+			}
+			return md.String(content + "\n\n")
+		},
+	})
+
+	// Unwrap figures explicitly
+	conv.AddRules(md.Rule{
+		Filter: []string{"figure"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			return md.String(content)
+		},
+	})
+
+	// Treat <br> as a real line break
+	conv.AddRules(md.Rule{
+		Filter: []string{"br"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			return md.String("\n")
+		},
+	})
+
+	// Force images to emit Markdown images using the already rewritten local src
+	conv.AddRules(md.Rule{
+		Filter: []string{"img"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			src, _ := selec.Attr("src")
+			alt, _ := selec.Attr("alt")
+			alt = strings.TrimSpace(alt)
+			if alt == "" {
+				// fall back to file name as alt text
+				alt = path.Base(src)
+			}
+			if src == "" {
+				return nil
+			}
+			return md.String(fmt.Sprintf("![%s](%s)", alt, src))
+		},
+	})
+
+	out, err := conv.ConvertString(html)
+	if err != nil {
+		return "", err
+	}
+	// If converter yielded only images (no text paragraphs), extract <p> text and prepend it
+	if !hasNonImageText(out) {
+		paras := extractParagraphs(html)
+		if len(paras) > 0 {
+			var sb strings.Builder
+			for _, t := range paras {
+				if tt := strings.TrimSpace(t); tt != "" {
+					sb.WriteString(tt)
+					sb.WriteString("\n\n")
+				}
+			}
+			sb.WriteString(out)
+			out = sb.String()
+		}
+	}
+	return out, nil
+}
+
+func hasNonImageText(md string) bool {
+	for _, line := range strings.Split(md, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "" {
+			continue
+		}
+		if strings.HasPrefix(trim, "![") { // image line
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func extractParagraphs(html string) []string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	doc.Find("p").Each(func(i int, p *goquery.Selection) {
+		if t := strings.TrimSpace(p.Text()); t != "" {
+			out = append(out, t)
+		}
+	})
+	return out
+}
+
+// Preprocess HTML to simplify WordPress figures/galleries before Markdown conversion
+func simplifyForMarkdown(html string) string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return html
+	}
+
+	// Unwrap galleries: keep only the <img> tags, separated by <br/>
+	doc.Find(".wp-block-gallery").Each(func(i int, g *goquery.Selection) {
+		var parts []string
+		g.Find("img").Each(func(_ int, img *goquery.Selection) {
+			h, err := goquery.OuterHtml(img)
+			if err == nil {
+				parts = append(parts, h)
+			}
+		})
+		repl := strings.Join(parts, "<br/>")
+		if strings.TrimSpace(repl) == "" {
+			if inner, err := g.Html(); err == nil {
+				repl = inner
+			}
+		}
+		_ = g.ReplaceWithHtml(repl)
+	})
+
+	// Unwrap generic <figure> wrappers
+	doc.Find("figure").Each(func(i int, f *goquery.Selection) {
+		inner, _ := f.Html()
+		if strings.TrimSpace(inner) == "" {
+			f.Remove()
+			return
+		}
+		_ = f.ReplaceWithHtml(inner)
+	})
+
+	// Drop empty paragraphs (that have no inline content)
+	doc.Find("p").Each(func(i int, p *goquery.Selection) {
+		text := strings.TrimSpace(p.Text())
+		if text == "" && p.Find("img, a, br").Length() == 0 {
+			p.Remove()
+		}
+	})
+
+	// Serialize back to string
+	var outParts []string
+	if doc.Find("body").Length() > 0 {
+		doc.Find("body").Contents().Each(func(i int, s *goquery.Selection) {
+			h, err := goquery.OuterHtml(s)
+			if err == nil {
+				outParts = append(outParts, h)
+			}
+		})
+	} else {
+		doc.Selection.Contents().Each(func(i int, s *goquery.Selection) {
+			h, err := goquery.OuterHtml(s)
+			if err == nil {
+				outParts = append(outParts, h)
+			}
+		})
+	}
+	return strings.TrimSpace(strings.Join(outParts, ""))
 }
 
 func parsePubDate(p string, loc *time.Location) (time.Time, error) {
@@ -485,7 +677,40 @@ func ensureTrailingSlash(p string) string {
 
 var slugRe = regexp.MustCompile(`[^a-z0-9\-]+`)
 
+func replaceEmojisWithCode(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if isEmojiRune(r) {
+			b.WriteString("u")
+			b.WriteString(strings.ToUpper(fmt.Sprintf("%X", r)))
+		} else if r == '\u200D' || r == '\uFE0F' { // ZWJ / variation selector – drop
+			continue
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isEmojiRune(r rune) bool {
+	// Common emoji blocks (not exhaustive, but good coverage)
+	if (r >= 0x1F300 && r <= 0x1F5FF) || // Misc Symbols & Pictographs
+		(r >= 0x1F600 && r <= 0x1F64F) || // Emoticons
+		(r >= 0x1F680 && r <= 0x1F6FF) || // Transport & Map
+		(r >= 0x1F700 && r <= 0x1F77F) || // Alchemical Symbols
+		(r >= 0x1F900 && r <= 0x1F9FF) || // Supplemental Symbols & Pictographs
+		(r >= 0x1FA70 && r <= 0x1FAFF) || // Symbols & Pictographs Extended-A
+		(r >= 0x2600 && r <= 0x26FF) || // Misc Symbols
+		(r >= 0x2700 && r <= 0x27BF) || // Dingbats
+		(r >= 0x1F1E6 && r <= 0x1F1FF) { // Regional Indicator Symbols (flags)
+		return true
+	}
+	return false
+}
+
 func slugify(s string) string {
+	s = replaceEmojisWithCode(s)
 	s = strings.ToLower(s)
 	s = strings.ReplaceAll(s, " ", "-")
 	s = slugRe.ReplaceAllString(s, "-")
@@ -505,14 +730,29 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 	}
 
 	doc.Find("img").Each(func(i int, s *goquery.Selection) {
+		// 1) Emojis aus s.w.org / wp-smiley direkt als Unicode einsetzen
+		cls, _ := s.Attr("class")
+		src, _ := s.Attr("src")
+		if strings.Contains(cls, "wp-smiley") || strings.Contains(src, "/s.w.org/images/core/emoji/") {
+			if alt, ok := s.Attr("alt"); ok && strings.TrimSpace(alt) != "" {
+				_ = s.ReplaceWithHtml(alt) // Emoji als Text
+			} else {
+				_ = s.ReplaceWithHtml("") // sicherheitshalber entfernen
+			}
+			return
+		}
+
 		parentGallery := s.ParentsFiltered(".wp-block-gallery")
 		isGallery := parentGallery.Length() > 0
-		src, _ := s.Attr("src")
 		srcset, _ := s.Attr("srcset")
 		best := pickBestSrc(src, srcset)
 		if best == "" {
 			return
 		}
+
+		// 2) Auf Originaldatei ohne -WxH / -scaled verweisen
+		origURL := toOriginalURL(best)
+
 		base := filepath.Join(*staticDir, "images", slug)
 		relBase := filepath.ToSlash(path.Join("/images", slug))
 		if isGallery {
@@ -521,15 +761,21 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 		}
 		_ = os.MkdirAll(base, 0o755)
 
-		filename := filenameFromURL(best)
+		filename := filenameFromURL(origURL)
 		dest := filepath.Join(base, filename)
 		rel := path.Join(relBase, filename)
 
-		dl.Schedule(best, dest)
+		// 3) Download und Umschreiben der Attribute (src, evtl. a[href])
+		dl.Schedule(origURL, dest)
 
 		s.RemoveAttr("srcset")
 		s.RemoveAttr("sizes")
 		s.SetAttr("src", rel)
+
+		// Falls das Bild von einem Link umschlossen ist, den Link ebenfalls lokal machen
+		if a := s.ParentsFiltered("a").First(); a.Length() > 0 {
+			a.SetAttr("href", rel)
+		}
 	})
 
 	// Serialize modified HTML back to string (inner contents)
@@ -555,6 +801,28 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 }
 
 var srcsetRe = regexp.MustCompile(`,?\s*([^\s,]+)\s+(\d+)w`)
+var wpSizeSuffixRe = regexp.MustCompile(`-(?:\d+)x(?:\d+)(?:-[0-9]+)?$`)
+var wpScaledSuffixRe = regexp.MustCompile(`-scaled(?:-[0-9]+)?$`)
+
+func toOriginalURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	base := path.Base(u.Path)
+	dir := path.Dir(u.Path)
+	ext := path.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	name = stripWPSuffixes(name)
+	u.Path = path.Join(dir, name+ext)
+	return u.String()
+}
+
+func stripWPSuffixes(name string) string {
+	name = wpSizeSuffixRe.ReplaceAllString(name, "")
+	name = wpScaledSuffixRe.ReplaceAllString(name, "")
+	return name
+}
 
 func pickBestSrc(src string, srcset string) string {
 	src = strings.TrimSpace(src)
