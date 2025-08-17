@@ -560,6 +560,7 @@ func extractParagraphs(html string) []string {
 			out = append(out, t)
 		}
 	})
+
 	return out
 }
 
@@ -641,7 +642,29 @@ func toMarkdownPreserveOrder(html string) (string, error) {
 			})
 			return
 		}
-
+		// Special handling: Gutenberg video block or plain <video>
+		if s.Is(".wp-block-video, figure.wp-block-video, video") {
+			var vs *goquery.Selection
+			if s.Is("video") {
+				vs = s
+			} else {
+				vs = s.Find("video").First()
+			}
+			if vs.Length() > 0 {
+				src, _ := vs.Attr("src")
+				if strings.TrimSpace(src) == "" {
+					if vv := vs.Find("source").First(); vv.Length() > 0 {
+						src, _ = vv.Attr("src")
+					}
+				}
+				if strings.TrimSpace(src) != "" {
+					name := path.Base(src)
+					// Output a plain Markdown link to the local video path
+					b.WriteString(fmt.Sprintf("[Video: %s](%s)\n\n", name, src))
+				}
+			}
+			return
+		}
 		// Default: convert this fragment as-is to preserve order
 		h, err := goquery.OuterHtml(s)
 		if err != nil {
@@ -819,7 +842,36 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 			a.SetAttr("href", rel)
 		}
 	})
+	// Handle HTML5 videos: download to static/videos/$slug and rewrite src to local path
+	doc.Find("video").Each(func(i int, v *goquery.Selection) {
+		src, _ := v.Attr("src")
+		// Some WP videos use <source src> children instead of video@src
+		if strings.TrimSpace(src) == "" {
+			if vv := v.Find("source").First(); vv.Length() > 0 {
+				src, _ = vv.Attr("src")
+			}
+		}
+		if strings.TrimSpace(src) == "" {
+			return
+		}
 
+		base := filepath.Join(*staticDir, "videos", slug)
+		relBase := filepath.ToSlash(path.Join("/videos", slug))
+		_ = os.MkdirAll(base, 0o755)
+
+		filename := filenameFromURL(src)
+		dest := filepath.Join(base, filename)
+		rel := path.Join(relBase, filename)
+
+		// schedule download of the original video URL (no WP size suffix stripping for videos)
+		dl.Schedule(src, dest)
+
+		// rewrite video@src and any <source src> children to the local relative path
+		v.SetAttr("src", rel)
+		v.Find("source").Each(func(_ int, s *goquery.Selection) {
+			s.SetAttr("src", rel)
+		})
+	})
 	// Serialize modified HTML back to string (inner contents)
 	var outParts []string
 	root := doc.Selection
