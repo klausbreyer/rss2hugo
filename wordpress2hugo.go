@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -71,6 +72,9 @@ var (
 	timezone    = flag.String("tz", "Europe/Berlin", "IANA timezone for front matter dates, e.g. Europe/Berlin")
 	limitItems  = flag.Int("limit", 1, "Process only the first N items (0 = all)")
 	concurrency = flag.Int("concurrency", 6, "Concurrent image download workers")
+	timeoutSec  = flag.Int("timeout", 120, "Per-request download timeout in seconds")
+	retries     = flag.Int("retries", 3, "Number of download retries on failure")
+	perHost     = flag.Int("perhost", 4, "Max concurrent downloads per host")
 	verbose     = flag.Bool("v", true, "Verbose output")
 	clean       = flag.Bool("clean", true, "Delete output folders (content/posts and static/images|galleries) before run")
 )
@@ -101,8 +105,8 @@ func main() {
 		loc = time.Local
 	}
 
-	// Image downloader with deduplication
-	dl := newDownloader(*concurrency)
+	// Image downloader with deduplication and per-host concurrency
+	dl := newDownloader(*concurrency, *perHost)
 
 	n := len(rss.Channel.Items)
 	if *limitItems > 0 && *limitItems < n {
@@ -804,29 +808,63 @@ func filenameFromURL(raw string) string {
 // Downloader implements deduplicated concurrent downloads
 
 type downloader struct {
-	wg   sync.WaitGroup
-	sem  chan struct{}
-	seen sync.Map // url -> struct{}
+	wg      sync.WaitGroup
+	sem     chan struct{}
+	seen    sync.Map // url -> struct{}
+	hostSem map[string]chan struct{}
+	mu      sync.Mutex
+	perHost int
 }
 
-func newDownloader(concurrency int) *downloader {
+func newDownloader(concurrency int, perhost int) *downloader {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &downloader{sem: make(chan struct{}, concurrency)}
+	if perhost < 1 {
+		perhost = 1
+	}
+	return &downloader{
+		sem:     make(chan struct{}, concurrency),
+		hostSem: make(map[string]chan struct{}),
+		perHost: perhost,
+	}
 }
 
-func (d *downloader) Schedule(url string, dest string) {
-	if _, exists := d.seen.LoadOrStore(url, struct{}{}); exists {
+func (d *downloader) getHostSem(host string) chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ch, ok := d.hostSem[host]; ok {
+		return ch
+	}
+	ch := make(chan struct{}, d.perHost)
+	d.hostSem[host] = ch
+	return ch
+}
+
+func (d *downloader) Schedule(rawURL string, dest string) {
+	if _, exists := d.seen.LoadOrStore(rawURL, struct{}{}); exists {
 		return
 	}
+	host := ""
+	if u, err := url.Parse(rawURL); err == nil {
+		host = u.Host
+	}
+	var hsem chan struct{}
+	if host != "" {
+		hsem = d.getHostSem(host)
+	}
+
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
 		d.sem <- struct{}{}
 		defer func() { <-d.sem }()
-		if err := downloadFile(url, dest); err != nil {
-			log.Printf("download failed %s -> %s: %v", url, dest, err)
+		if hsem != nil {
+			hsem <- struct{}{}
+			defer func() { <-hsem }()
+		}
+		if err := downloadFile(rawURL, dest); err != nil {
+			log.Printf("download failed %s -> %s: %v", rawURL, dest, err)
 		} else if *verbose {
 			log.Printf("downloaded %s", dest)
 		}
@@ -836,66 +874,87 @@ func (d *downloader) Schedule(url string, dest string) {
 func (d *downloader) Wait() { d.wg.Wait() }
 
 func downloadFile(rawURL, dest string) error {
-	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		client := &http.Client{Timeout: 60 * time.Second}
+	// Skip if file already exists and is non-empty
+	if st, err := os.Stat(dest); err == nil && st.Size() > 0 {
+		return nil
+	}
+
+	attempts := *retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	t := time.Duration(*timeoutSec) * time.Second
+	if t < 10*time.Second {
+		t = 10 * time.Second
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		transport := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: *perHost,
+			MaxConnsPerHost:     *perHost,
+		}
+		client := &http.Client{Timeout: t, Transport: transport}
+
 		req, err := http.NewRequest("GET", rawURL, nil)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("User-Agent", "wordpress2hugo/1.0 (+https://example.com)")
+
 		resp, err := client.Do(req)
 		if err != nil {
-			lastErr = err
-			if attempt < 3 {
-				time.Sleep(time.Duration(attempt*2) * time.Second)
-				continue
+			if attempt == attempts {
+				return err
 			}
-			return lastErr
+			// backoff with jitter
+			time.Sleep(time.Duration(attempt*2)*time.Second + time.Duration(rand.Intn(500))*time.Millisecond)
+			continue
 		}
 
+		var copyErr error
 		func() {
 			defer resp.Body.Close()
 			if resp.StatusCode >= 500 {
-				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				copyErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 				return
 			}
 			if resp.StatusCode >= 400 {
-				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 				// client errors → don’t retry
-				attempt = 3
+				copyErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				attempt = attempts
 				return
 			}
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-				lastErr = err
+				copyErr = err
 				return
 			}
 			f, err := os.Create(dest)
 			if err != nil {
-				lastErr = err
+				copyErr = err
 				return
 			}
 			defer func() {
 				f.Close()
-				if lastErr != nil {
-					_ = os.Remove(dest) // remove partial file
+				if copyErr != nil {
+					_ = os.Remove(dest)
 				}
 			}()
 			if _, err = io.Copy(f, resp.Body); err != nil {
-				lastErr = err
+				copyErr = err
 				return
 			}
-			lastErr = nil
 		}()
 
-		if lastErr == nil {
+		if copyErr == nil {
 			return nil
 		}
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+		if attempt == attempts {
+			return copyErr
 		}
+		time.Sleep(time.Duration(attempt*2)*time.Second + time.Duration(rand.Intn(500))*time.Millisecond)
 	}
-	return lastErr
+	return fmt.Errorf("unreachable")
 }
 
 func fileExists(p string) bool {
