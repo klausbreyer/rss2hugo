@@ -241,36 +241,6 @@ func loadRSS(src string) (*RSS, error) {
 	return out, nil
 }
 
-// charsetReader lets encoding/xml handle non-UTF8 feeds if needed
-func charsetReader(charset string, input io.Reader) (io.Reader, error) {
-	// Most WP feeds are UTF-8, so just return input
-	return input, nil
-}
-
-func htmlEntityMap() map[string]string {
-	return map[string]string{
-		"nbsp":   " ",
-		"raquo":  "»",
-		"laquo":  "«",
-		"ndash":  "–",
-		"mdash":  "—",
-		"hellip": "…",
-		"copy":   "©",
-		"reg":    "®",
-		"trade":  "™",
-		"rsquo":  "’",
-		"lsquo":  "‘",
-		"rdquo":  "”",
-		"ldquo":  "“",
-		"euro":   "€",
-		"amp":    "&",
-		"lt":     "<",
-		"gt":     ">",
-		"quot":   "\"",
-		"apos":   "'",
-	}
-}
-
 func sanitizeXML(b []byte) []byte {
 	s := string(b)
 	s = removeInvalidXMLChars(s)
@@ -464,105 +434,6 @@ func setToSortedSlice(m map[string]struct{}) []string {
 	return s
 }
 
-func htmlToMarkdown(html string, base *url.URL) (string, error) {
-	conv := md.NewConverter("", false, nil) // keep links as-is (relative)
-
-	// Ensure paragraphs are kept as paragraphs
-	conv.AddRules(md.Rule{
-		Filter: []string{"p"},
-		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
-			content = strings.TrimSpace(content)
-			if content == "" {
-				return nil
-			}
-			return md.String(content + "\n\n")
-		},
-	})
-
-	// Unwrap figures explicitly
-	conv.AddRules(md.Rule{
-		Filter: []string{"figure"},
-		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
-			return md.String(content)
-		},
-	})
-
-	// Treat <br> as a real line break
-	conv.AddRules(md.Rule{
-		Filter: []string{"br"},
-		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
-			return md.String("\n")
-		},
-	})
-
-	// Force images to emit Markdown images using the already rewritten local src
-	conv.AddRules(md.Rule{
-		Filter: []string{"img"},
-		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
-			src, _ := selec.Attr("src")
-			alt, _ := selec.Attr("alt")
-			alt = strings.TrimSpace(alt)
-			if alt == "" {
-				// fall back to file name as alt text
-				alt = path.Base(src)
-			}
-			if src == "" {
-				return nil
-			}
-			return md.String(fmt.Sprintf("![%s](%s)", alt, src))
-		},
-	})
-
-	out, err := conv.ConvertString(html)
-	if err != nil {
-		return "", err
-	}
-	// If converter yielded only images (no text paragraphs), extract <p> text and prepend it
-	if !hasNonImageText(out) {
-		paras := extractParagraphs(html)
-		if len(paras) > 0 {
-			var sb strings.Builder
-			for _, t := range paras {
-				if tt := strings.TrimSpace(t); tt != "" {
-					sb.WriteString(tt)
-					sb.WriteString("\n\n")
-				}
-			}
-			sb.WriteString(out)
-			out = sb.String()
-		}
-	}
-	return out, nil
-}
-
-func hasNonImageText(md string) bool {
-	for _, line := range strings.Split(md, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "" {
-			continue
-		}
-		if strings.HasPrefix(trim, "![") { // image line
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func extractParagraphs(html string) []string {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return nil
-	}
-	var out []string
-	doc.Find("p").Each(func(i int, p *goquery.Selection) {
-		if t := strings.TrimSpace(p.Text()); t != "" {
-			out = append(out, t)
-		}
-	})
-	return out
-}
-
 // Convert HTML to Markdown, preserving paragraph order and text.
 func toMarkdownPreserveOrder(html string) (string, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
@@ -641,7 +512,29 @@ func toMarkdownPreserveOrder(html string) (string, error) {
 			})
 			return
 		}
-
+		// Special handling: Gutenberg video block or plain <video>
+		if s.Is(".wp-block-video, figure.wp-block-video, video") {
+			var vs *goquery.Selection
+			if s.Is("video") {
+				vs = s
+			} else {
+				vs = s.Find("video").First()
+			}
+			if vs.Length() > 0 {
+				src, _ := vs.Attr("src")
+				if strings.TrimSpace(src) == "" {
+					if vv := vs.Find("source").First(); vv.Length() > 0 {
+						src, _ = vv.Attr("src")
+					}
+				}
+				if strings.TrimSpace(src) != "" {
+					name := path.Base(src)
+					// Output a plain Markdown link to the local video path
+					b.WriteString(fmt.Sprintf("[Video: %s](%s)\n\n", name, src))
+				}
+			}
+			return
+		}
 		// Default: convert this fragment as-is to preserve order
 		h, err := goquery.OuterHtml(s)
 		if err != nil {
@@ -819,7 +712,36 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 			a.SetAttr("href", rel)
 		}
 	})
+	// Handle HTML5 videos: download to static/videos/$slug and rewrite src to local path
+	doc.Find("video").Each(func(i int, v *goquery.Selection) {
+		src, _ := v.Attr("src")
+		// Some WP videos use <source src> children instead of video@src
+		if strings.TrimSpace(src) == "" {
+			if vv := v.Find("source").First(); vv.Length() > 0 {
+				src, _ = vv.Attr("src")
+			}
+		}
+		if strings.TrimSpace(src) == "" {
+			return
+		}
 
+		base := filepath.Join(*staticDir, "videos", slug)
+		relBase := filepath.ToSlash(path.Join("/videos", slug))
+		_ = os.MkdirAll(base, 0o755)
+
+		filename := filenameFromURL(src)
+		dest := filepath.Join(base, filename)
+		rel := path.Join(relBase, filename)
+
+		// schedule download of the original video URL (no WP size suffix stripping for videos)
+		dl.Schedule(src, dest)
+
+		// rewrite video@src and any <source src> children to the local relative path
+		v.SetAttr("src", rel)
+		v.Find("source").Each(func(_ int, s *goquery.Selection) {
+			s.SetAttr("src", rel)
+		})
+	})
 	// Serialize modified HTML back to string (inner contents)
 	var outParts []string
 	root := doc.Selection
