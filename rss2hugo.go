@@ -336,6 +336,9 @@ func processItem(item Item, loc *time.Location, dl *downloader) error {
 		}
 		year, month = pubDateYearMonth(item.PubDate, loc)
 		slugTail = slugify(path.Base(strings.Trim(u.Path, "/")))
+	} else {
+		// sanitize slug from URL (remove emojis, spaces, etc.)
+		slugTail = slugify(slugTail)
 	}
 	slug := fmt.Sprintf("%s-%s-%s", year, month, slugTail)
 
