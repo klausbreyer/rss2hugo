@@ -379,8 +379,7 @@ func processItem(item Item, loc *time.Location, dl *downloader) error {
 		return fmt.Errorf("rewrite images: %w", err)
 	}
 
-	normalizedHTML := simplifyForMarkdown(processedHTML)
-	bodyMD, err := htmlToMarkdown(normalizedHTML, u)
+	bodyMD, err := toMarkdownPreserveOrder(processedHTML)
 	if err != nil {
 		return fmt.Errorf("html->md: %w", err)
 	}
@@ -564,67 +563,110 @@ func extractParagraphs(html string) []string {
 	return out
 }
 
-// Preprocess HTML to simplify WordPress figures/galleries before Markdown conversion
-func simplifyForMarkdown(html string) string {
+// Convert HTML to Markdown, preserving paragraph order and text.
+func toMarkdownPreserveOrder(html string) (string, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
-		return html
+		return "", err
 	}
 
-	// Unwrap galleries: keep only the <img> tags, separated by <br/>
-	doc.Find(".wp-block-gallery").Each(func(i int, g *goquery.Selection) {
-		var parts []string
-		g.Find("img").Each(func(_ int, img *goquery.Selection) {
-			h, err := goquery.OuterHtml(img)
-			if err == nil {
-				parts = append(parts, h)
+	conv := md.NewConverter("", false, nil)
+	// Paragraphs → keep as paragraphs with blank line
+	conv.AddRules(md.Rule{
+		Filter: []string{"p"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			content = strings.TrimSpace(content)
+			if content == "" {
+				return nil
 			}
-		})
-		repl := strings.Join(parts, "<br/>")
-		if strings.TrimSpace(repl) == "" {
-			if inner, err := g.Html(); err == nil {
-				repl = inner
+			return md.String(content + "\n\n")
+		},
+	})
+	// Line breaks
+	conv.AddRules(md.Rule{
+		Filter: []string{"br"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			return md.String("\n")
+		},
+	})
+	// Images → emit with trailing blank line so adjacent images don't glue together
+	conv.AddRules(md.Rule{
+		Filter: []string{"img"},
+		Replacement: func(content string, selec *goquery.Selection, opt *md.Options) *string {
+			src, _ := selec.Attr("src")
+			alt, _ := selec.Attr("alt")
+			alt = strings.TrimSpace(alt)
+			if alt == "" {
+				alt = path.Base(src)
 			}
-		}
-		_ = g.ReplaceWithHtml(repl)
+			if src == "" {
+				return nil
+			}
+			return md.String(fmt.Sprintf("![%s](%s)\n\n", alt, src))
+		},
 	})
 
-	// Unwrap generic <figure> wrappers
-	doc.Find("figure").Each(func(i int, f *goquery.Selection) {
-		inner, _ := f.Html()
-		if strings.TrimSpace(inner) == "" {
-			f.Remove()
+	var b strings.Builder
+	var roots *goquery.Selection
+	if doc.Find("body").Length() > 0 {
+		roots = doc.Find("body").Contents()
+	} else {
+		roots = doc.Selection.Contents()
+	}
+
+	roots.Each(func(i int, s *goquery.Selection) {
+		// Skip pure-whitespace text nodes
+		if goquery.NodeName(s) == "#text" {
+			if strings.TrimSpace(s.Text()) == "" {
+				return
+			}
+			// Emit text as a paragraph
+			b.WriteString(strings.TrimSpace(s.Text()))
+			b.WriteString("\n\n")
 			return
 		}
-		_ = f.ReplaceWithHtml(inner)
-	})
 
-	// Drop empty paragraphs (that have no inline content)
-	doc.Find("p").Each(func(i int, p *goquery.Selection) {
-		text := strings.TrimSpace(p.Text())
-		if text == "" && p.Find("img, a, br").Length() == 0 {
-			p.Remove()
+		// Special handling: Gutenberg gallery block → emit each image in place
+		if s.Is(".wp-block-gallery, figure.wp-block-gallery") {
+			s.Find("img").Each(func(_ int, img *goquery.Selection) {
+				src, _ := img.Attr("src")
+				alt, _ := img.Attr("alt")
+				alt = strings.TrimSpace(alt)
+				if alt == "" {
+					alt = path.Base(src)
+				}
+				if src != "" {
+					b.WriteString(fmt.Sprintf("![%s](%s)\n\n", alt, src))
+				}
+			})
+			return
+		}
+
+		// Default: convert this fragment as-is to preserve order
+		h, err := goquery.OuterHtml(s)
+		if err != nil {
+			return
+		}
+		frag, err := conv.ConvertString(h)
+		if err != nil {
+			return
+		}
+		if strings.TrimSpace(frag) == "" {
+			// Fallback: if conversion yields empty (e.g., container-only nodes), use visible text
+			if txt := strings.TrimSpace(s.Text()); txt != "" {
+				b.WriteString(txt)
+				b.WriteString("\n\n")
+			}
+			return
+		}
+		b.WriteString(frag)
+		// Ensure a trailing newline if the fragment didn't add one
+		if !strings.HasSuffix(frag, "\n") {
+			b.WriteString("\n")
 		}
 	})
 
-	// Serialize back to string
-	var outParts []string
-	if doc.Find("body").Length() > 0 {
-		doc.Find("body").Contents().Each(func(i int, s *goquery.Selection) {
-			h, err := goquery.OuterHtml(s)
-			if err == nil {
-				outParts = append(outParts, h)
-			}
-		})
-	} else {
-		doc.Selection.Contents().Each(func(i int, s *goquery.Selection) {
-			h, err := goquery.OuterHtml(s)
-			if err == nil {
-				outParts = append(outParts, h)
-			}
-		})
-	}
-	return strings.TrimSpace(strings.Join(outParts, ""))
+	return strings.TrimSpace(b.String()), nil
 }
 
 func parsePubDate(p string, loc *time.Location) (time.Time, error) {
@@ -889,30 +931,66 @@ func (d *downloader) Schedule(url string, dest string) {
 func (d *downloader) Wait() { d.wg.Wait() }
 
 func downloadFile(rawURL, dest string) error {
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		client := &http.Client{Timeout: 60 * time.Second}
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "rss2hugo/1.0 (+https://example.com)")
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt*2) * time.Second)
+				continue
+			}
+			return lastErr
+		}
+
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				return
+			}
+			if resp.StatusCode >= 400 {
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				// client errors → don’t retry
+				attempt = 3
+				return
+			}
+			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+				lastErr = err
+				return
+			}
+			f, err := os.Create(dest)
+			if err != nil {
+				lastErr = err
+				return
+			}
+			defer func() {
+				f.Close()
+				if lastErr != nil {
+					_ = os.Remove(dest) // remove partial file
+				}
+			}()
+			if _, err = io.Copy(f, resp.Body); err != nil {
+				lastErr = err
+				return
+			}
+			lastErr = nil
+		}()
+
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
 	}
-	req.Header.Set("User-Agent", "rss2hugo/1.0 (+https://example.com)")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
-	}
-	f, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	return lastErr
 }
 
 func fileExists(p string) bool {
