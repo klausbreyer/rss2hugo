@@ -1,4 +1,4 @@
-module rss2hugo
+module wordpress2hugo
 
 go 1.25.0
 
