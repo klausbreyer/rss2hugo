@@ -657,6 +657,10 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 		return "", err
 	}
 
+	// Per-post image numbering (001_, 002_, ...), based on first mention order
+	imageIndex := 1
+	assigned := make(map[string]int) // original URL -> assigned index
+
 	doc.Find("img").Each(func(i int, s *goquery.Selection) {
 		// 1) Emojis aus s.w.org / wp-smiley direkt als Unicode einsetzen
 		cls, _ := s.Attr("class")
@@ -683,7 +687,16 @@ func rewriteAndDownloadImages(html string, slug string, dl *downloader) (string,
 		relBase := filepath.ToSlash(path.Join("/media", slug))
 		_ = os.MkdirAll(base, 0o755)
 
-		filename := filenameFromURL(origURL)
+		// Assign stable, per-post index for this original URL based on first mention
+		num, ok := assigned[origURL]
+		if !ok {
+			num = imageIndex
+			assigned[origURL] = num
+			imageIndex++
+		}
+		prefix := fmt.Sprintf("%03d_", num)
+
+		filename := prefix + filenameFromURL(origURL)
 		dest := filepath.Join(base, filename)
 		rel := path.Join(relBase, filename)
 
